@@ -3,7 +3,7 @@ const { encode } = require('./base62');
 
 const KEY = 'url:counter';
 const BLOCK = 1000;
-const START = 916132832; // 62^5 -> first code is "100000"
+const START = 916132832; // 62^5; the first generated code is "100001".
 
 let current = 1;
 let max = 0;

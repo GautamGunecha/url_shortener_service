@@ -7,10 +7,13 @@ const FLUSHING = `clicks:flushing:${process.pid}`;
 async function flushClicks() {
   // finish a previous failed flush first, otherwise grab the pending hash
   if (!(await redis.exists(FLUSHING))) {
+    if (!(await redis.exists(PENDING))) return;
+
     try {
       await redis.rename(PENDING, FLUSHING); // atomic, so instances never double-count
-    } catch {
-      return; // nothing pending
+    } catch (err) {
+      if (err.message.includes("no such key")) return;
+      throw err;
     }
   }
 

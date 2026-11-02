@@ -2,38 +2,76 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const connectDB = require("./db");
+const redis = require("./redis");
+const { Url } = require("./models");
+const { nextCode } = require("./idGenerator");
+const { validateUrlInput } = require("./validateUrl");
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 3001);
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
+const MAX_CODE_ATTEMPTS = 3;
 
-const { Url } = require('./models');
-const { nextCode } = require('./idGenerator');
+app.use(express.json({ limit: "16kb" }));
 
-app.use(express.json());
-
-app.get("/health", (req, res) => {
-  res.json({
+app.get("/health", (_req, res) => {
+  const dbConnected = mongoose.connection.readyState === 1;
+  const redisConnected = redis.status === "ready";
+  res.status(dbConnected && redisConnected ? 200 : 503).json({
     service: "write-service",
-    status: "ok",
-    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    status: dbConnected && redisConnected ? "ok" : "unavailable",
+    db: dbConnected ? "connected" : "disconnected",
+    redis: redis.status,
   });
 });
 
-app.post("/api/urls", async (req, res) => {
-  const { longUrl, userId } = req.body;
-  if (!longUrl) return res.status(400).json({ message: 'longUrl is required' });
+app.post("/api/urls", async (req, res, next) => {
+  const validation = validateUrlInput(req.body);
+  if (validation.error) {
+    return res.status(400).json({ message: validation.error });
+  }
 
-  const shortCode = await nextCode();
-  await Url.create({ shortCode, longUrl, userId });
+  try {
+    for (let attempt = 0; attempt < MAX_CODE_ATTEMPTS; attempt += 1) {
+      const shortCode = await nextCode();
+      try {
+        await Url.create({ ...validation.value, shortCode });
+        return res.status(201).json({
+          shortCode,
+          shortUrl: `${PUBLIC_BASE_URL}/${shortCode}`,
+        });
+      } catch (err) {
+        if (err?.code !== 11000 || attempt === MAX_CODE_ATTEMPTS - 1) {
+          throw err;
+        }
+      }
+    }
+  } catch (err) {
+    return next(err);
+  }
+});
 
-  res.status(201).json({ shortCode, shortUrl: `http://localhost:3000/${shortCode}` });
+app.use((err, _req, res, _next) => {
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    return res.status(400).json({ message: "Request body must contain valid JSON" });
+  }
+
+  if (err.status === 413) {
+    return res.status(413).json({ message: "Request body is too large" });
+  }
+
+  console.error("Write-service request failed:", err.message);
+  return res.status(500).json({ message: "Internal server error" });
 });
 
 connectDB()
-  .then(() =>
-    app.listen(PORT, () => console.log(`Write-service running on :${PORT}`)),
-  )
+  .then(() => {
+    app.listen(PORT, () => console.log(`Write-service running on :${PORT}`));
+  })
   .catch((err) => {
     console.error("MongoDB connection failed:", err.message);
-    process.exit(1);
+    process.exitCode = 1;
+    redis.disconnect();
   });

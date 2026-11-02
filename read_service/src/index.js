@@ -5,66 +5,149 @@ const connectDB = require("./db");
 const redis = require("./redis");
 const { Url } = require("./models");
 const { startClickFlusher, flushClicks } = require("./clicks");
+const { isValidShortCode } = require("./shortCode");
 
 const app = express();
-const PORT = process.env.PORT || 3002;
-
-const CACHE_TTL = 60 * 60 * 24; // 24h
-const NOT_FOUND_TTL = 60; // remember misses briefly so bad codes don't hit Mongo
+const PORT = Number(process.env.PORT || 3002);
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
+const CACHE_TTL = 60 * 60 * 24;
+const NOT_FOUND_TTL = 60;
 const NOT_FOUND = "__none__";
 
-app.get("/health", (req, res) => {
-  res.json({
+app.get("/health", (_req, res) => {
+  const dbConnected = mongoose.connection.readyState === 1;
+  const redisConnected = redis.status === "ready";
+  res.status(dbConnected && redisConnected ? 200 : 503).json({
     service: "read-service",
-    status: "ok",
-    db: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-    redis: redis.status === "ready" ? "connected" : redis.status,
+    status: dbConnected && redisConnected ? "ok" : "unavailable",
+    db: dbConnected ? "connected" : "disconnected",
+    redis: redis.status,
   });
 });
 
-app.get("/:code", async (req, res) => {
+app.get("/api/urls/:code", async (req, res, next) => {
   const { code } = req.params;
-  if (!/^[A-Za-z0-9]{1,10}$/.test(code)) {
+  if (!isValidShortCode(code)) {
     return res.status(404).json({ message: "Short URL not found" });
   }
 
   try {
-    const key = `cache:url:${code}`;
-    let longUrl = await redis.get(key);
-
-    if (longUrl === NOT_FOUND) {
+    const url = await Url.findOne({ shortCode: code })
+      .select("shortCode longUrl clicks createdAt")
+      .lean();
+    if (!url) {
       return res.status(404).json({ message: "Short URL not found" });
     }
 
-    if (!longUrl) {
-      const doc = await Url.findOne({ shortCode: code }, "longUrl").lean();
-      if (!doc) {
-        await redis.set(key, NOT_FOUND, "EX", NOT_FOUND_TTL);
-        return res.status(404).json({ message: "Short URL not found" });
-      }
-      longUrl = doc.longUrl;
-      await redis.set(key, longUrl, "EX", CACHE_TTL);
-    }
-
-    redis.hincrby("clicks:pending", code, 1).catch(() => {}); // don't block the redirect
-    res.redirect(302, longUrl);
+    return res.json({
+      shortCode: url.shortCode,
+      shortUrl: `${PUBLIC_BASE_URL}/${url.shortCode}`,
+      longUrl: url.longUrl,
+      clicks: url.clicks,
+      createdAt: url.createdAt,
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Internal server error" });
+    return next(err);
   }
 });
 
+app.get("/:code", async (req, res, next) => {
+  const { code } = req.params;
+  if (!isValidShortCode(code)) {
+    return res.status(404).json({ message: "Short URL not found" });
+  }
+
+  const cacheKey = `cache:url:${code}`;
+  let longUrl;
+  try {
+    longUrl = await redis.get(cacheKey);
+  } catch (err) {
+    console.error("URL cache lookup failed:", err.message);
+  }
+
+  if (longUrl === NOT_FOUND) {
+    return res.status(404).json({ message: "Short URL not found" });
+  }
+
+  if (!longUrl) {
+    try {
+      const url = await Url.findOne({ shortCode: code }, "longUrl").lean();
+      if (!url) {
+        try {
+          await redis.set(cacheKey, NOT_FOUND, "EX", NOT_FOUND_TTL);
+        } catch (err) {
+          console.error("URL miss cache write failed:", err.message);
+        }
+        return res.status(404).json({ message: "Short URL not found" });
+      }
+
+      longUrl = url.longUrl;
+      try {
+        await redis.set(cacheKey, longUrl, "EX", CACHE_TTL);
+      } catch (err) {
+        console.error("URL cache write failed:", err.message);
+      }
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  try {
+    await redis.hincrby("clicks:pending", code, 1);
+  } catch (err) {
+    console.error("Click counter update failed:", err.message);
+  }
+
+  return res.redirect(302, longUrl);
+});
+
+app.use((_req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+app.use((err, _req, res, _next) => {
+  console.error("Read-service request failed:", err.message);
+  res.status(500).json({ message: "Internal server error" });
+});
+
+let server;
+let clickFlusher;
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; shutting down read-service`);
+
+  if (clickFlusher) clearInterval(clickFlusher);
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  try {
+    await flushClicks();
+  } catch (err) {
+    console.error("Final click flush failed:", err.message);
+    process.exitCode = 1;
+  }
+
+  await Promise.allSettled([mongoose.disconnect(), redis.quit()]);
+}
+
 connectDB()
   .then(() => {
-    startClickFlusher();
-    app.listen(PORT, () => console.log(`Read-service running on :${PORT}`));
+    clickFlusher = startClickFlusher();
+    server = app.listen(PORT, () =>
+      console.log(`Read-service running on :${PORT}`),
+    );
   })
   .catch((err) => {
     console.error("MongoDB connection failed:", err.message);
-    process.exit(1);
+    process.exitCode = 1;
+    redis.disconnect();
   });
 
-process.on("SIGINT", async () => {
-  await flushClicks().catch(() => {});
-  process.exit(0);
-});
+process.once("SIGINT", () => void shutdown("SIGINT"));
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
