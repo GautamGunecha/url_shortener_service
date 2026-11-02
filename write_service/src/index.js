@@ -6,6 +6,9 @@ const connectDB = require("./db");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const { Url } = require('./models');
+const { nextCode } = require('./idGenerator');
+
 app.use(express.json());
 
 app.get("/health", (req, res) => {
@@ -16,8 +19,14 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.post("/api/urls", (req, res) => {
-  res.status(501).json({ message: "Not implemented yet" });
+app.post("/api/urls", async (req, res) => {
+  const { longUrl, userId } = req.body;
+  if (!longUrl) return res.status(400).json({ message: 'longUrl is required' });
+
+  const shortCode = await nextCode();
+  await Url.create({ shortCode, longUrl, userId });
+
+  res.status(201).json({ shortCode, shortUrl: `http://localhost:3000/${shortCode}` });
 });
 
 connectDB()
@@ -28,4 +37,3 @@ connectDB()
     console.error("MongoDB connection failed:", err.message);
     process.exit(1);
   });
-
